@@ -21,11 +21,20 @@
 #
 
 import serial
-import sys, os, time, struct
+import sys, os, time, struct, re, errno
 import argparse
 import collections
 from stcgal.models import MCUModelDatabase
 from stcgal.utils import Utils
+from stcgal.options import *
+import functools
+
+try:
+    import usb.core, usb.util
+    _usb_available = True
+except ImportError:
+    _usb_available = False
+
 
 class StcFramingException(Exception):
     """Something wrong with packet framing or checksum"""
@@ -35,573 +44,6 @@ class StcFramingException(Exception):
 class StcProtocolException(Exception):
     """High-level protocol issue, like wrong packet type"""
     pass
-
-
-class BaseOption:
-    def print(self):
-        print("Target options:")
-        for name, get_func, _ in self.options:
-            print("  %s=%s" % (name, get_func()))
-
-    def set_option(self, name, value):
-        for opt, _, set_func in self.options:
-            if opt == name:
-                print("Option %s=%s" % (name, value))
-                set_func(value)
-                return
-        raise ValueError("unknown")
-
-    def get_option(self, name):
-        for opt, get_func, _ in self.options:
-            if opt == name:
-                return get_func(name)
-        raise ValueError("unknown")
-
-    def get_msr(self):
-        return bytes(self.msr)
-
-
-class Stc89Option(BaseOption):
-    """Manipulation STC89 series option byte"""
-
-    def __init__(self, msr):
-        self.msr = msr
-        self.options = (
-            ("cpu_6t_enabled", self.get_t6, self.set_t6),
-            ("bsl_pindetect_enabled", self.get_pindetect, self.set_pindetect),
-            ("eeprom_erase_enabled", self.get_ee_erase, self.set_ee_erase),
-            ("clock_gain", self.get_clock_gain, self.set_clock_gain),
-            ("ale_enabled", self.get_ale, self.set_ale),
-            ("xram_enabled", self.get_xram, self.set_xram),
-            ("watchdog_por_enabled", self.get_watchdog, self.set_watchdog),
-        )
-
-    def get_msr(self):
-        return self.msr
-
-    def get_t6(self):
-        return not bool(self.msr & 1)
-
-    def set_t6(self, val):
-        val = Utils.to_bool(val);
-        self.msr &= 0xfe
-        self.msr |= 0x01 if not bool(val) else 0x00
-
-    def get_pindetect(self):
-        return not bool(self.msr & 4)
-
-    def set_pindetect(self, val):
-        val = Utils.to_bool(val);
-        self.msr &= 0xfb
-        self.msr |= 0x04 if not bool(val) else 0x00
-
-    def get_ee_erase(self):
-        return not bool(self.msr & 8)
-
-    def set_ee_erase(self, val):
-        val = Utils.to_bool(val);
-        self.msr &= 0xf7
-        self.msr |= 0x08 if not bool(val) else 0x00
-
-    def get_clock_gain(self):
-        gain = bool(self.msr & 16)
-        return "high" if gain else "low"
-
-    def set_clock_gain(self, val):
-        gains = {"low": 0, "high": 0x10}
-        if val not in gains.keys():
-            raise ValueError("must be one of %s" % list(gains.keys()))
-        self.msr &= 0xef
-        self.msr |= gains[val]
-
-    def get_ale(self):
-        return bool(self.msr & 32)
-
-    def set_ale(self, val):
-        val = Utils.to_bool(val);
-        self.msr &= 0xdf
-        self.msr |= 0x20 if bool(val) else 0x00
-
-    def get_xram(self):
-        return bool(self.msr & 64)
-
-    def set_xram(self, val):
-        val = Utils.to_bool(val);
-        self.msr &= 0xbf
-        self.msr |= 0x40 if bool(val) else 0x00
-
-    def get_watchdog(self):
-        return not bool(self.msr & 128)
-
-    def set_watchdog(self, val):
-        val = Utils.to_bool(val);
-        self.msr &= 0x7f
-        self.msr |= 0x80 if not bool(val) else 0x00
-
-
-class Stc12AOption(BaseOption):
-    """Manipulate STC12A series option bytes"""
-
-    def __init__(self, msr):
-        assert len(msr) == 5
-        self.msr = bytearray(msr)
-
-        """list of options and their handlers"""
-        self.options = (
-            ("low_voltage_reset", self.get_low_voltage_detect, self.set_low_voltage_detect),
-            ("clock_source", self.get_clock_source, self.set_clock_source),
-            ("watchdog_por_enabled", self.get_watchdog, self.set_watchdog),
-            ("watchdog_stop_idle", self.get_watchdog_idle, self.set_watchdog_idle),
-            ("watchdog_prescale", self.get_watchdog_prescale, self.set_watchdog_prescale),
-            ("eeprom_erase_enabled", self.get_ee_erase, self.set_ee_erase),
-            ("bsl_pindetect_enabled", self.get_pindetect, self.set_pindetect),
-        )
-
-    def get_low_voltage_detect(self):
-        return not bool(self.msr[4] & 64)
-
-    def set_low_voltage_detect(self, val):
-        val = Utils.to_bool(val);
-        self.msr[4] &= 0xbf
-        self.msr[4] |= 0x40 if not val else 0x00
-
-    def get_clock_source(self):
-        source = bool(self.msr[0] & 2)
-        return "external" if source else "internal"
-
-    def set_clock_source(self, val):
-        sources = {"internal": 0, "external": 1}
-        if val not in sources.keys():
-            raise ValueError("must be one of %s" % list(sources.keys()))
-        self.msr[0] &= 0xfd
-        self.msr[0] |= sources[val] << 1
-
-    def get_watchdog(self):
-        return not bool(self.msr[1] & 32)
-
-    def set_watchdog(self, val):
-        val = Utils.to_bool(val);
-        self.msr[1] &= 0xdf
-        self.msr[1] |= 0x20 if not val else 0x00
-
-    def get_watchdog_idle(self):
-        return not bool(self.msr[1] & 8)
-
-    def set_watchdog_idle(self, val):
-        val = Utils.to_bool(val);
-        self.msr[1] &= 0xf7
-        self.msr[1] |= 0x08 if not val else 0x00
-
-    def get_watchdog_prescale(self):
-        return 2 ** (((self.msr[1]) & 0x07) + 1)
-
-    def set_watchdog_prescale(self, val):
-        val = Utils.to_int(val)
-        wd_vals = {2: 0, 4: 1, 8: 2, 16: 3, 32: 4, 64: 5, 128: 6, 256: 7}
-        if val not in wd_vals.keys():
-            raise ValueError("must be one of %s" % list(wd_vals.keys()))
-        self.msr[1] &= 0xf8
-        self.msr[1] |= wd_vals[val]
-
-    def get_ee_erase(self):
-        return not bool(self.msr[2] & 2)
-
-    def set_ee_erase(self, val):
-        val = Utils.to_bool(val);
-        self.msr[2] &= 0xfd
-        self.msr[2] |= 0x02 if not val else 0x00
-
-    def get_pindetect(self):
-        return not bool(self.msr[2] & 1)
-
-    def set_pindetect(self, val):
-        val = Utils.to_bool(val);
-        self.msr[2] &= 0xfe
-        self.msr[2] |= 0x01 if not val else 0x00
-
-
-class Stc12Option(BaseOption):
-    """Manipulate STC10/11/12 series option bytes"""
-
-    def __init__(self, msr):
-        assert len(msr) == 4
-        self.msr = bytearray(msr)
-
-        """list of options and their handlers"""
-        self.options = (
-            ("reset_pin_enabled", self.get_reset_pin_enabled, self.set_reset_pin_enabled),
-            ("low_voltage_reset", self.get_low_voltage_detect, self.set_low_voltage_detect),
-            ("oscillator_stable_delay", self.get_osc_stable_delay, self.set_osc_stable_delay),
-            ("por_reset_delay", self.get_por_delay, self.set_por_delay),
-            ("clock_gain", self.get_clock_gain, self.set_clock_gain),
-            ("clock_source", self.get_clock_source, self.set_clock_source),
-            ("watchdog_por_enabled", self.get_watchdog, self.set_watchdog),
-            ("watchdog_stop_idle", self.get_watchdog_idle, self.set_watchdog_idle),
-            ("watchdog_prescale", self.get_watchdog_prescale, self.set_watchdog_prescale),
-            ("eeprom_erase_enabled", self.get_ee_erase, self.set_ee_erase),
-            ("bsl_pindetect_enabled", self.get_pindetect, self.set_pindetect),
-        )
-
-    def get_reset_pin_enabled(self):
-        return bool(self.msr[0] & 1)
-
-    def set_reset_pin_enabled(self, val):
-        val = Utils.to_bool(val);
-        self.msr[0] &= 0xfe
-        self.msr[0] |= 0x01 if bool(val) else 0x00
-
-    def get_low_voltage_detect(self):
-        return not bool(self.msr[0] & 64)
-
-    def set_low_voltage_detect(self, val):
-        val = Utils.to_bool(val);
-        self.msr[0] &= 0xbf
-        self.msr[0] |= 0x40 if not val else 0x00
-
-    def get_osc_stable_delay(self):
-        return 2 ** (((self.msr[0] >> 4) & 0x03) + 12)
-
-    def set_osc_stable_delay(self, val):
-        val = Utils.to_int(val)
-        osc_vals = {4096: 0, 8192: 1, 16384: 2, 32768: 3}
-        if val not in osc_vals.keys():
-            raise ValueError("must be one of %s" % list(osc_vals.keys()))
-        self.msr[0] &= 0xcf
-        self.msr[0] |= osc_vals[val] << 4
-
-    def get_por_delay(self):
-        delay = not bool(self.msr[1] & 128)
-        return "long" if delay else "short"
-
-    def set_por_delay(self, val):
-        delays = {"short": 1, "long": 0}
-        if val not in delays.keys():
-            raise ValueError("must be one of %s" % list(delays.keys()))
-        self.msr[1] &= 0x7f
-        self.msr[1] |= delays[val] << 7
-
-    def get_clock_gain(self):
-        gain = bool(self.msr[1] & 64)
-        return "high" if gain else "low"
-
-    def set_clock_gain(self, val):
-        gains = {"low": 0, "high": 1}
-        if val not in gains.keys():
-            raise ValueError("must be one of %s" % list(gains.keys()))
-        self.msr[1] &= 0xbf
-        self.msr[1] |= gains[val] << 6
-
-    def get_clock_source(self):
-        source = bool(self.msr[1] & 2)
-        return "external" if source else "internal"
-
-    def set_clock_source(self, val):
-        sources = {"internal": 0, "external": 1}
-        if val not in sources.keys():
-            raise ValueError("must be one of %s" % list(sources.keys()))
-        self.msr[1] &= 0xfd
-        self.msr[1] |= sources[val] << 1
-
-    def get_watchdog(self):
-        return not bool(self.msr[2] & 32)
-
-    def set_watchdog(self, val):
-        val = Utils.to_bool(val);
-        self.msr[2] &= 0xdf
-        self.msr[2] |= 0x20 if not val else 0x00
-
-    def get_watchdog_idle(self):
-        return not bool(self.msr[2] & 8)
-
-    def set_watchdog_idle(self, val):
-        val = Utils.to_bool(val);
-        self.msr[2] &= 0xf7
-        self.msr[2] |= 0x08 if not val else 0x00
-
-    def get_watchdog_prescale(self):
-        return 2 ** (((self.msr[2]) & 0x07) + 1)
-
-    def set_watchdog_prescale(self, val):
-        val = Utils.to_int(val)
-        wd_vals = {2: 0, 4: 1, 8: 2, 16: 3, 32: 4, 64: 5, 128: 6, 256: 7}
-        if val not in wd_vals.keys():
-            raise ValueError("must be one of %s" % list(wd_vals.keys()))
-        self.msr[2] &= 0xf8
-        self.msr[2] |= wd_vals[val]
-
-    def get_ee_erase(self):
-        return not bool(self.msr[3] & 2)
-
-    def set_ee_erase(self, val):
-        val = Utils.to_bool(val);
-        self.msr[3] &= 0xfd
-        self.msr[3] |= 0x02 if not val else 0x00
-
-    def get_pindetect(self):
-        return not bool(self.msr[3] & 1)
-
-    def set_pindetect(self, val):
-        val = Utils.to_bool(val);
-        self.msr[3] &= 0xfe
-        self.msr[3] |= 0x01 if not val else 0x00
-
-
-class Stc15AOption(BaseOption):
-    def __init__(self, msr):
-        assert len(msr) == 13
-        self.msr = bytearray(msr)
-
-        self.options = (
-            ("reset_pin_enabled", self.get_reset_pin_enabled, self.set_reset_pin_enabled),
-            ("watchdog_por_enabled", self.get_watchdog, self.set_watchdog),
-            ("watchdog_stop_idle", self.get_watchdog_idle, self.set_watchdog_idle),
-            ("watchdog_prescale", self.get_watchdog_prescale, self.set_watchdog_prescale),
-            ("low_voltage_reset", self.get_lvrs, self.set_lvrs),
-            ("low_voltage_threshold", self.get_low_voltage, self.set_low_voltage),
-            ("eeprom_lvd_inhibit", self.get_eeprom_lvd, self.set_eeprom_lvd),
-            ("eeprom_erase_enabled", self.get_ee_erase, self.set_ee_erase),
-            ("bsl_pindetect_enabled", self.get_pindetect, self.set_pindetect),
-        )
-
-    def set_trim(self, val):
-        self.msr[3:5] = struct.pack(">H", val)
-
-    def get_reset_pin_enabled(self):
-        return bool(self.msr[0] & 16)
-
-    def set_reset_pin_enabled(self, val):
-        val = Utils.to_bool(val);
-        self.msr[0] &= 0xef
-        self.msr[0] |= 0x10 if bool(val) else 0x00
-
-    def get_watchdog(self):
-        return not bool(self.msr[2] & 32)
-
-    def set_watchdog(self, val):
-        val = Utils.to_bool(val);
-        self.msr[2] &= 0xdf
-        self.msr[2] |= 0x20 if not val else 0x00
-
-    def get_watchdog_idle(self):
-        return not bool(self.msr[2] & 8)
-
-    def set_watchdog_idle(self, val):
-        val = Utils.to_bool(val);
-        self.msr[2] &= 0xf7
-        self.msr[2] |= 0x08 if not val else 0x00
-
-    def get_watchdog_prescale(self):
-        return 2 ** (((self.msr[2]) & 0x07) + 1)
-
-    def set_watchdog_prescale(self, val):
-        val = Utils.to_int(val)
-        wd_vals = {2: 0, 4: 1, 8: 2, 16: 3, 32: 4, 64: 5, 128: 6, 256: 7}
-        if val not in wd_vals.keys():
-            raise ValueError("must be one of %s" % list(wd_vals.keys()))
-        self.msr[2] &= 0xf8
-        self.msr[2] |= wd_vals[val]
-
-    def get_lvrs(self):
-        return bool(self.msr[1] & 64)
-
-    def set_lvrs(self, val):
-        val = Utils.to_bool(val);
-        self.msr[1] &= 0xbf
-        self.msr[1] |= 0x40 if val else 0x00
-
-    def get_eeprom_lvd(self):
-        return bool(self.msr[1] & 128)
-
-    def set_eeprom_lvd(self, val):
-        val = Utils.to_bool(val);
-        self.msr[1] &= 0x7f
-        self.msr[1] |= 0x80 if val else 0x00
-
-    def get_low_voltage(self):
-        return self.msr[1] & 0x07
-
-    def set_low_voltage(self, val):
-        val = Utils.to_int(val)
-        if val not in range(0, 8):
-            raise ValueError("must be one of %s" % list(range(0, 8)))
-        self.msr[1] &= 0xf8
-        self.msr[1] |= val
-
-    def get_ee_erase(self):
-        return not bool(self.msr[12] & 2)
-
-    def set_ee_erase(self, val):
-        val = Utils.to_bool(val);
-        self.msr[12] &= 0xfd
-        self.msr[12] |= 0x02 if not val else 0x00
-
-    def get_pindetect(self):
-        return not bool(self.msr[12] & 1)
-
-    def set_pindetect(self, val):
-        val = Utils.to_bool(val);
-        self.msr[12] &= 0xfe
-        self.msr[12] |= 0x01 if not val else 0x00
-
-
-class Stc15Option(BaseOption):
-    def __init__(self, msr):
-        assert len(msr) == 4
-        self.msr = bytearray(msr)
-
-        self.options = (
-            ("reset_pin_enabled", self.get_reset_pin_enabled, self.set_reset_pin_enabled),
-            ("clock_source", self.get_clock_source, self.set_clock_source),
-            ("clock_gain", self.get_clock_gain, self.set_clock_gain),
-            ("watchdog_por_enabled", self.get_watchdog, self.set_watchdog),
-            ("watchdog_stop_idle", self.get_watchdog_idle, self.set_watchdog_idle),
-            ("watchdog_prescale", self.get_watchdog_prescale, self.set_watchdog_prescale),
-            ("low_voltage_reset", self.get_lvrs, self.set_lvrs),
-            ("low_voltage_threshold", self.get_low_voltage, self.set_low_voltage),
-            ("eeprom_lvd_inhibit", self.get_eeprom_lvd, self.set_eeprom_lvd),
-            ("eeprom_erase_enabled", self.get_ee_erase, self.set_ee_erase),
-            ("bsl_pindetect_enabled", self.get_pindetect, self.set_pindetect),
-            ("por_reset_delay", self.get_por_delay, self.set_por_delay),
-            ("rstout_por_state", self.get_p33_state, self.set_p33_state),
-            ("uart2_passthrough", self.get_uart_passthrough, self.set_uart_passthrough),
-            ("uart2_pin_mode", self.get_uart_pin_mode, self.set_uart_pin_mode),
-        )
-
-    def get_reset_pin_enabled(self):
-        return not bool(self.msr[2] & 16)
-
-    def set_reset_pin_enabled(self, val):
-        val = Utils.to_bool(val);
-        self.msr[2] &= 0xef
-        self.msr[2] |= 0x10 if not bool(val) else 0x00
-
-    def get_clock_source(self):
-        source = bool(self.msr[2] & 0x01)
-        return "internal" if source else "external"
-
-    def set_clock_source(self, val):
-        sources = {"internal": 1, "external": 0}
-        if val not in sources.keys():
-            raise ValueError("must be one of %s" % list(sources.keys()))
-        self.msr[2] &= 0xfe
-        self.msr[2] |= sources[val]
-
-    def get_clock_gain(self):
-        gain = bool(self.msr[2] & 0x02)
-        return "high" if gain else "low"
-
-    def set_clock_gain(self, val):
-        gains = {"low": 0, "high": 1}
-        if val not in gains.keys():
-            raise ValueError("must be one of %s" % list(gains.keys()))
-        self.msr[2] &= 0xfd
-        self.msr[2] |= gains[val] << 1
-
-    def get_watchdog(self):
-        return not bool(self.msr[0] & 32)
-
-    def set_watchdog(self, val):
-        val = Utils.to_bool(val);
-        self.msr[0] &= 0xdf
-        self.msr[0] |= 0x20 if not val else 0x00
-
-    def get_watchdog_idle(self):
-        return not bool(self.msr[0] & 8)
-
-    def set_watchdog_idle(self, val):
-        val = Utils.to_bool(val);
-        self.msr[0] &= 0xf7
-        self.msr[0] |= 0x08 if not val else 0x00
-
-    def get_watchdog_prescale(self):
-        return 2 ** (((self.msr[0]) & 0x07) + 1)
-
-    def set_watchdog_prescale(self, val):
-        val = Utils.to_int(val)
-        wd_vals = {2: 0, 4: 1, 8: 2, 16: 3, 32: 4, 64: 5, 128: 6, 256: 7}
-        if val not in wd_vals.keys():
-            raise ValueError("must be one of %s" % list(wd_vals.keys()))
-        self.msr[0] &= 0xf8
-        self.msr[0] |= wd_vals[val]
-
-    def get_lvrs(self):
-        return not bool(self.msr[1] & 64)
-
-    def set_lvrs(self, val):
-        val = Utils.to_bool(val);
-        self.msr[1] &= 0xbf
-        self.msr[1] |= 0x40 if not val else 0x00
-
-    def get_eeprom_lvd(self):
-        return bool(self.msr[1] & 128)
-
-    def set_eeprom_lvd(self, val):
-        val = Utils.to_bool(val);
-        self.msr[1] &= 0x7f
-        self.msr[1] |= 0x80 if val else 0x00
-
-    def get_low_voltage(self):
-        return self.msr[1] & 0x07
-
-    def set_low_voltage(self, val):
-        val = Utils.to_int(val)
-        if val not in range(0, 8):
-            raise ValueError("must be one of %s" % list(range(0, 8)))
-        self.msr[1] &= 0xf8
-        self.msr[1] |= val
-
-    def get_ee_erase(self):
-        return bool(self.msr[3] & 2)
-
-    def set_ee_erase(self, val):
-        val = Utils.to_bool(val);
-        self.msr[3] &= 0xfd
-        self.msr[3] |= 0x02 if val else 0x00
-
-    def get_pindetect(self):
-        return not bool(self.msr[3] & 1)
-
-    def set_pindetect(self, val):
-        val = Utils.to_bool(val);
-        self.msr[3] &= 0xfe
-        self.msr[3] |= 0x01 if not val else 0x00
-
-    def get_por_delay(self):
-        delay = bool(self.msr[2] & 128)
-        return "long" if delay else "short"
-
-    def set_por_delay(self, val):
-        delays = {"short": 0, "long": 1}
-        if val not in delays.keys():
-            raise ValueError("must be one of %s" % list(delays.keys()))
-        self.msr[2] &= 0x7f
-        self.msr[2] |= delays[val] << 7
-
-    def get_p33_state(self):
-        return "high" if self.msr[2] & 0x08 else "low"
-
-    def set_p33_state(self, val):
-        val = Utils.to_bool(val)
-        self.msr[2] &= 0xf7
-        self.msr[2] |= 0x08 if val else 0x00
-
-    def get_uart_passthrough(self):
-        return bool(self.msr[2] & 0x40)
-
-    def set_uart_passthrough(self, val):
-        val = Utils.to_bool(val)
-        self.msr[2] &= 0xbf
-        self.msr[2] |= 0x40 if val else 0x00
-
-    def get_uart_pin_mode(self):
-        return "push-pull" if bool(self.msr[2] & 0x20) else "normal"
-
-    def set_uart_pin_mode(self, val):
-        delays = {"normal": 0, "push-pull": 1}
-        if val not in delays.keys():
-            raise ValueError("must be one of %s" % list(delays.keys()))
-        self.msr[2] &= 0xdf
-        self.msr[2] |= 0x20 if val else 0x00
 
 
 class StcBaseProtocol:
@@ -619,6 +61,8 @@ class StcBaseProtocol:
     """magic byte for packets sent by host"""
     PACKET_HOST = bytes([0x6a])
 
+    PARITY = serial.PARITY_NONE
+
     def __init__(self, port, baud_handshake, baud_transfer):
         self.port = port
         self.baud_handshake = baud_handshake
@@ -631,18 +75,13 @@ class StcBaseProtocol:
         self.model = None
         self.uid = None
         self.debug = False
+        self.status_packet = None
+        self.protocol_name = None
 
     def dump_packet(self, data, receive=True):
         if self.debug:
             print("%s Packet data: %s" % (("<-" if receive else "->"),
                   Utils.hexstr(data, " ")), file=sys.stderr)
-
-    def modular_sum(self, data):
-        """modular 16-bit sum"""
-
-        s = 0
-        for b in data: s += b
-        return s & 0xffff
 
     def read_bytes_safe(self, num):
         """Read data from serial port with timeout handling
@@ -655,113 +94,14 @@ class StcBaseProtocol:
 
         return data
 
-    def print_mcu_info(self):
-        """Print MCU status information"""
+    def extract_payload(self, packet):
+        """Extract the payload of a packet"""
 
-        MCUModelDatabase.print_model_info(self.model)
-        print("Target frequency: %.3f MHz" % (self.mcu_clock_hz / 1E6))
-        print("Target BSL version: %s" % self.mcu_bsl_version)
+        if packet[-1] != self.PACKET_END[0]:
+            self.dump_packet(packet)
+            raise StcFramingException("incorrect frame end")
 
-    def pulse(self):
-        """Send a sequence of 0x7f bytes for synchronization"""
-
-        while True:
-            self.ser.write(b"\x7f")
-            self.ser.flush()
-            time.sleep(0.015)
-            if self.ser.inWaiting() > 0: break
-
-    def initialize_model(self):
-        """Initialize model-specific information"""
-
-        try:
-            self.model = MCUModelDatabase.find_model(self.mcu_magic)
-        except NameError:
-            msg = ("WARNING: Unknown model %02X%02X!" %
-                (self.mcu_magic >> 8, self.mcu_magic & 0xff))
-            print(msg, file=sys.stderr)
-            self.model = MCUModelDatabase.MCUModel(name="UNKNOWN",
-                magic=self.mcu_magic, total=63488, code=63488, eeprom=0)
-        self.print_mcu_info()
-
-    def get_status_packet(self):
-        """Read and decode status packet"""
-
-        status_packet = self.read_packet()
-        if status_packet[0] != 0x50:
-            raise StcProtocolException("incorrect magic in status packet")
-        return status_packet
-
-    def get_iap_delay(self, clock_hz):
-        """IAP wait states for STC12A+ (according to datasheet(s))"""
-
-        iap_wait = 0x80
-        if clock_hz < 1E6: iap_wait = 0x87
-        elif clock_hz < 2E6: iap_wait = 0x86
-        elif clock_hz < 3E6: iap_wait = 0x85
-        elif clock_hz < 6E6: iap_wait = 0x84
-        elif clock_hz < 12E6: iap_wait = 0x83
-        elif clock_hz < 20E6: iap_wait = 0x82
-        elif clock_hz < 24E6: iap_wait = 0x81
-
-        return iap_wait
-
-    def set_option(self, name, value):
-        self.options.set_option(name, value)
-
-    def connect(self):
-        """Connect to MCU and initialize communication.
-
-        Set up serial port, send sync sequence and get part info.
-        """
-
-        self.ser = serial.Serial(port=self.port, baudrate=self.baud_handshake,
-                                 parity=self.PARITY)
-
-        # conservative timeout values
-        self.ser.timeout = 10.0
-        self.ser.interCharTimeout = 1.0
-
-        print("Waiting for MCU, please cycle power: ", end="")
-        sys.stdout.flush()
-
-        # send sync, and wait for MCU response
-        # ignore errors until we see a valid response
-        status_packet = None
-        while not status_packet:
-            try:
-                self.pulse()
-                status_packet = self.get_status_packet()
-            except (StcFramingException, serial.SerialTimeoutException): pass
-        print("done")
-
-        self.initialize_status(status_packet)
-        self.initialize_model()
-        self.initialize_options(status_packet)
-
-    def disconnect(self):
-        """Disconnect from MCU"""
-
-        # reset mcu
-        packet = bytes([0x82])
-        self.write_packet(packet)
-        self.ser.close()
-        print("Disconnected!")
-
-
-class Stc89Protocol(StcBaseProtocol):
-    """Protocol handler for STC 89/90 series"""
-
-    """These don't use any parity"""
-    PARITY = serial.PARITY_NONE
-
-    """block size for programming flash"""
-    PROGRAM_BLOCKSIZE = 128
-
-    def __init__(self, port, baud_handshake, baud_transfer):
-        StcBaseProtocol.__init__(self, port, baud_handshake, baud_transfer)
-
-        self.cpu_6t = None
+        return packet[5:-1]
 
     def read_packet(self):
         """Read and check packet from MCU.
@@ -801,22 +141,214 @@ class Stc89Protocol(StcBaseProtocol):
         packet_len, = struct.unpack(">H", packet[3:5])
         packet += self.read_bytes_safe(packet_len - 3)
 
-        # verify end code
-        if packet[packet_len+1] != self.PACKET_END[0]:
-            self.dump_packet(packet)
-            raise StcFramingException("incorrect frame end")
-
-        # verify checksum
-        packet_csum = packet[packet_len]
-        calc_csum = sum(packet[2:packet_len]) & 0xff
-        if packet_csum != calc_csum:
-            self.dump_packet(packet)
-            raise StcFramingException("packet checksum mismatch")
+        # verify checksum and extract payload
+        payload = self.extract_payload(packet)
 
         self.dump_packet(packet, receive=True)
 
         # payload only is returned
-        return packet[5:packet_len]
+        return payload
+
+    def print_mcu_info(self):
+        """Print MCU status information"""
+
+        MCUModelDatabase.print_model_info(self.model)
+        print("Target frequency: %.3f MHz" % (self.mcu_clock_hz / 1E6))
+        print("Target BSL version: %s" % self.mcu_bsl_version)
+
+    def pulse(self, character=b"\x7f", timeout=0):
+        """Send a sequence of bytes for synchronization with MCU"""
+
+        duration = 0
+        while True:
+            if timeout > 0 and duration > timeout:
+                raise serial.SerialTimeoutException("pulse timeout")
+            self.ser.write(character)
+            self.ser.flush()
+            time.sleep(0.015)
+            duration += 0.015
+            if self.ser.inWaiting() > 0: break
+
+    def initialize_model(self):
+        """Initialize model-specific information"""
+
+        self.mcu_magic, = struct.unpack(">H", self.status_packet[20:22])
+        try:
+            self.model = MCUModelDatabase.find_model(self.mcu_magic)
+        except NameError:
+            msg = ("WARNING: Unknown model %02X%02X!" %
+                (self.mcu_magic >> 8, self.mcu_magic & 0xff))
+            print(msg, file=sys.stderr)
+            self.model = MCUModelDatabase.MCUModel(name="UNKNOWN",
+                magic=self.mcu_magic, total=63488, code=63488, eeprom=0)
+
+        # special case for duplicated mcu magic,
+        #   0xf294 (STC15F104W, STC15F104E)
+        #   0xf2d4 (STC15L104W, STC15L104E)
+        # duplicated mcu magic can be found using command,
+        #   grep -o 'magic=[^,]*' models.py | sort | uniq -d
+        if self.mcu_magic in (0xF294, 0xF2D4):
+            mcu_name = self.model.name[:-1]
+            mcu_name += "E" if self.status_packet[17] < 0x70 else "W"
+            self.model = self.model._replace(name = mcu_name)
+
+        protocol_database = [("stc89", r"STC(89|90)(C|LE)\d"),
+                             ("stc12a", r"STC12(C|LE)\d052"),
+                             ("stc12b", r"STC12(C|LE)(52|56)"),
+                             ("stc12", r"(STC|IAP)(10|11|12)\D"),
+                             ("stc15a", r"(STC|IAP)15[FL][01]0\d(E|EA|)$"),
+                             ("stc15", r"(STC|IAP|IRC)15\D")]
+
+        for protocol_name, pattern in protocol_database:
+            if re.match(pattern, self.model.name):
+                self.protocol_name = protocol_name
+                break
+        else:
+            self.protocol_name = None
+
+    def get_status_packet(self):
+        """Read and decode status packet"""
+
+        packet = self.read_packet()
+        if packet[0] == 0x80:
+            # need to re-ack
+            self.ser.parity = serial.PARITY_EVEN
+            packet = (self.PACKET_START
+                      + self.PACKET_HOST
+                      + bytes([0x00, 0x07, 0x80, 0x00, 0xF1])
+                      + self.PACKET_END)
+            self.dump_packet(packet, receive=False)
+            self.ser.write(packet)
+            self.ser.flush()
+            self.pulse()
+            packet = self.read_packet()
+        return packet
+
+    def get_iap_delay(self, clock_hz):
+        """IAP wait states for STC12A+ (according to datasheet(s))"""
+
+        iap_wait = 0x80
+        if clock_hz < 1E6: iap_wait = 0x87
+        elif clock_hz < 2E6: iap_wait = 0x86
+        elif clock_hz < 3E6: iap_wait = 0x85
+        elif clock_hz < 6E6: iap_wait = 0x84
+        elif clock_hz < 12E6: iap_wait = 0x83
+        elif clock_hz < 20E6: iap_wait = 0x82
+        elif clock_hz < 24E6: iap_wait = 0x81
+
+        return iap_wait
+
+    def set_option(self, name, value):
+        self.options.set_option(name, value)
+
+    def reset_device(self, resetcmd=False):
+        if not resetcmd:
+            print("Cycling power: ", end="")
+            sys.stdout.flush()
+            self.ser.setDTR(True)
+            time.sleep(0.5)
+            self.ser.setDTR(False)
+            print("done")
+        else:
+            print("Cycling power via shell cmd: " + resetcmd)
+            os.system(resetcmd)
+
+        print("Waiting for MCU: ", end="")
+        sys.stdout.flush()
+
+    def connect(self, autoreset=False, resetcmd=False):
+        """Connect to MCU and initialize communication.
+
+        Set up serial port, send sync sequence and get part info.
+        """
+
+        self.ser = serial.Serial(port=self.port, parity=self.PARITY)
+        # set baudrate separately to work around a bug with the CH340 driver
+        # on older Linux kernels
+        self.ser.baudrate = self.baud_handshake
+
+        # fast timeout values to deal with detection errors
+        self.ser.timeout = 0.5
+        self.ser.interCharTimeout = 0.5
+
+        # avoid glitches if there is something in the input buffer
+        self.ser.flushInput()
+
+        if autoreset:
+            self.reset_device(resetcmd)
+        else:
+            print("Waiting for MCU, please cycle power: ", end="")
+            sys.stdout.flush()
+
+        # send sync, and wait for MCU response
+        # ignore errors until we see a valid response
+        self.status_packet = None
+        while not self.status_packet:
+            try:
+                self.pulse()
+                self.status_packet = self.get_status_packet()
+            except (StcFramingException, serial.SerialTimeoutException): pass
+        print("done")
+
+        # conservative timeout values
+        self.ser.timeout = 15.0
+        self.ser.interCharTimeout = 1.0
+
+        self.initialize_model()
+
+    def initialize(self, base_protocol = None):
+        if base_protocol:
+            self.ser = base_protocol.ser
+            self.ser.parity = self.PARITY
+            packet = base_protocol.status_packet
+            packet = (self.PACKET_START
+                      + self.PACKET_MCU
+                      + struct.pack(">H", len(packet) + 4)
+                      + packet
+                      + self.PACKET_END)
+            self.status_packet = self.extract_payload(packet)
+            self.mcu_magic = base_protocol.mcu_magic
+            self.model = base_protocol.model
+
+        self.initialize_status(self.status_packet)
+        self.print_mcu_info()
+        self.initialize_options(self.status_packet)
+
+    def disconnect(self):
+        """Disconnect from MCU"""
+
+        # reset mcu
+        packet = bytes([0x82])
+        self.write_packet(packet)
+        self.ser.close()
+        print("Disconnected!")
+
+
+class Stc89Protocol(StcBaseProtocol):
+    """Protocol handler for STC 89/90 series"""
+
+    """These don't use any parity"""
+    PARITY = serial.PARITY_NONE
+
+    """block size for programming flash"""
+    PROGRAM_BLOCKSIZE = 128
+
+    def __init__(self, port, baud_handshake, baud_transfer):
+        StcBaseProtocol.__init__(self, port, baud_handshake, baud_transfer)
+
+        self.cpu_6t = None
+
+    def extract_payload(self, packet):
+        """Verify the checksum of packet and return its payload"""
+
+        packet_csum = packet[-2]
+        calc_csum = sum(packet[2:-2]) & 0xff
+        if packet_csum != calc_csum:
+            self.dump_packet(packet)
+            raise StcFramingException("packet checksum mismatch")
+
+        payload = StcBaseProtocol.extract_payload(self, packet)
+        return payload[:-1]
 
     def write_packet(self, data):
         """Send packet to MCU.
@@ -887,7 +419,6 @@ class Stc89Protocol(StcBaseProtocol):
     def initialize_status(self, packet):
         """Decode status packet and store basic MCU info"""
 
-        self.mcu_magic, = struct.unpack(">H", packet[20:22])
         self.cpu_6t = not bool(packet[19] & 1)
 
         cpu_t = 6.0 if self.cpu_6t else 12.0
@@ -899,7 +430,7 @@ class Stc89Protocol(StcBaseProtocol):
 
         bl_version, bl_stepping = struct.unpack("BB", packet[17:19])
         self.mcu_bsl_version = "%d.%d%s" % (bl_version >> 4, bl_version & 0x0f,
-                                           chr(bl_stepping))
+                                            chr(bl_stepping))
 
     def handshake(self):
         """Switch to transfer baudrate
@@ -909,6 +440,7 @@ class Stc89Protocol(StcBaseProtocol):
 
         # check new baudrate
         print("Switching to %d baud: " % self.baud_transfer, end="")
+        sys.stdout.flush()
         brt, brt_csum, iap, delay = self.calculate_baud()
         print("checking ", end="")
         sys.stdout.flush()
@@ -1006,7 +538,37 @@ class Stc89Protocol(StcBaseProtocol):
         print("done")
 
 
-class Stc12AProtocol(Stc89Protocol):
+class Stc12AOptionsMixIn:
+    def program_options(self):
+        print("Setting options: ", end="")
+        sys.stdout.flush()
+        msr = self.options.get_msr()
+        packet = bytes([0x8d, msr[0], msr[1], msr[2], 0xff, msr[3]])
+        packet += struct.pack(">I", int(self.mcu_clock_hz))
+        packet += bytes([msr[3]])
+        packet += bytes([0xff, msr[0], msr[1], 0xff, 0xff, 0xff, 0xff, msr[2]])
+        packet += bytes([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+        packet += struct.pack(">I", int(self.mcu_clock_hz))
+        packet += bytes([0xff, 0xff, 0xff])
+
+        self.write_packet(packet)
+        response = self.read_packet()
+        if response[0] != 0x80:
+            raise StcProtocolException("incorrect magic in option packet")
+
+        # XXX: this is done by STC-ISP on newer parts. not sure why, but let's
+        # just replicate it, just to be sure.
+        if self.bsl_version >= 0x66:
+            packet = bytes([0x50])
+            self.write_packet(packet)
+            response = self.read_packet()
+            if response[0] != 0x10:
+                raise StcProtocolException("incorrect magic in option packet")
+
+        print("done")
+
+
+class Stc12AProtocol(Stc12AOptionsMixIn, Stc89Protocol):
 
     """countdown value for flash erase"""
     ERASE_COUNTDOWN = 0x0d
@@ -1017,8 +579,6 @@ class Stc12AProtocol(Stc89Protocol):
     def initialize_status(self, packet):
         """Decode status packet and store basic MCU info"""
 
-        self.mcu_magic, = struct.unpack(">H", packet[20:22])
-
         freq_counter = 0
         for i in range(8):
             freq_counter += struct.unpack(">H", packet[1+2*i:3+2*i])[0]
@@ -1027,7 +587,9 @@ class Stc12AProtocol(Stc89Protocol):
 
         bl_version, bl_stepping = struct.unpack("BB", packet[17:19])
         self.mcu_bsl_version = "%d.%d%s" % (bl_version >> 4, bl_version & 0x0f,
-                                           chr(bl_stepping))
+                                            chr(bl_stepping))
+
+        self.bsl_version = bl_version
 
     def calculate_baud(self):
         """Calculate MCU baudrate setting.
@@ -1059,13 +621,13 @@ class Stc12AProtocol(Stc89Protocol):
         """Initialize options"""
 
         # create option state
-        self.options = Stc12AOption(status_packet[23:28])
+        self.options = Stc12AOption(status_packet[23:26] + status_packet[29:30])
         self.options.print()
 
     def handshake(self):
         """Do baudrate handshake
 
-        Initate and do the (rather complicated) baudrate handshake.
+        Initiate and do the (rather complicated) baudrate handshake.
         """
 
         # start baudrate handshake
@@ -1127,23 +689,34 @@ class Stc12AProtocol(Stc89Protocol):
             raise StcProtocolException("incorrect magic in erase packet")
         print("done")
 
+
+class Stc12OptionsMixIn:
     def program_options(self):
         print("Setting options: ", end="")
         sys.stdout.flush()
         msr = self.options.get_msr()
+        # XXX: it's not 100% clear if the index of msr[3] is consistent
+        # between devices, so write it to both indices.
         packet = bytes([0x8d, msr[0], msr[1], msr[2], msr[3],
-                        msr[4]])
+                        0xff, 0xff, 0xff, 0xff, msr[3], 0xff,
+                        0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
 
         packet += struct.pack(">I", int(self.mcu_clock_hz))
         self.write_packet(packet)
         response = self.read_packet()
-        if response[0] != 0x80:
+        if response[0] != 0x50:
             raise StcProtocolException("incorrect magic in option packet")
         print("done")
 
+        # If UID wasn't sent with erase acknowledge, it should be in this packet
+        if not self.uid:
+            self.uid = response[18:25]
 
-class Stc12Protocol(StcBaseProtocol):
-    """Protocol handler for STC 10/11/12 series"""
+        print("Target UID: %s" % Utils.hexstr(self.uid))
+
+
+class Stc12BaseProtocol(StcBaseProtocol):
+    """Base class for STC 10/11/12 series protocol handlers"""
 
     """block size for programming flash"""
     PROGRAM_BLOCKSIZE = 128
@@ -1157,50 +730,17 @@ class Stc12Protocol(StcBaseProtocol):
     def __init__(self, port, baud_handshake, baud_transfer):
         StcBaseProtocol.__init__(self, port, baud_handshake, baud_transfer)
 
-    def read_packet(self):
-        """Read and check packet from MCU.
-        
-        Reads a packet of data from the MCU and and do
-        validity and checksum checks on it.
+    def extract_payload(self, packet):
+        """Verify the checksum of packet and return its payload"""
 
-        Returns packet payload or None in case of an error.
-        """
-
-        # read and check frame start magic
-        packet = bytes()
-        packet += self.read_bytes_safe(1)
-        if packet[0] != self.PACKET_START[0]:
-            raise StcFramingException("incorrect frame start")
-        packet += self.read_bytes_safe(1)
-        if packet[1] != self.PACKET_START[1]:
-            raise StcFramingException("incorrect frame start")
-
-        # read direction and length
-        packet += self.read_bytes_safe(3)
-        if packet[2] != self.PACKET_MCU[0]:
-            self.dump_packet(packet)
-            raise StcFramingException("incorrect packet direction magic")
-
-        # read packet data
-        packet_len, = struct.unpack(">H", packet[3:5])
-        packet += self.read_bytes_safe(packet_len - 3)
-
-        # verify end code
-        if packet[packet_len+1] != self.PACKET_END[0]:
-            self.dump_packet(packet)
-            raise StcFramingException("incorrect frame end")
-
-        # verify checksum
-        packet_csum, = struct.unpack(">H", packet[packet_len-1:packet_len+1])
-        calc_csum = sum(packet[2:packet_len-1]) & 0xffff
+        packet_csum, = struct.unpack(">H", packet[-3:-1])
+        calc_csum = sum(packet[2:-3]) & 0xffff
         if packet_csum != calc_csum:
             self.dump_packet(packet)
             raise StcFramingException("packet checksum mismatch")
 
-        self.dump_packet(packet, receive=True)
-
-        # payload only is returned
-        return packet[5:packet_len-1]
+        payload = StcBaseProtocol.extract_payload(self, packet)
+        return payload[:-2]
 
     def write_packet(self, data):
         """Send packet to MCU.
@@ -1228,8 +768,6 @@ class Stc12Protocol(StcBaseProtocol):
     def initialize_status(self, packet):
         """Decode status packet and store basic MCU info"""
 
-        self.mcu_magic, = struct.unpack(">H", packet[20:22])
-
         freq_counter = 0
         for i in range(8):
             freq_counter += struct.unpack(">H", packet[1+2*i:3+2*i])[0]
@@ -1238,7 +776,9 @@ class Stc12Protocol(StcBaseProtocol):
 
         bl_version, bl_stepping = struct.unpack("BB", packet[17:19])
         self.mcu_bsl_version = "%d.%d%s" % (bl_version >> 4, bl_version & 0x0f,
-                                           chr(bl_stepping))
+                                            chr(bl_stepping))
+
+        self.bsl_version = bl_version
 
     def calculate_baud(self):
         """Calculate MCU baudrate setting.
@@ -1265,12 +805,12 @@ class Stc12Protocol(StcBaseProtocol):
         delay = 0x80
 
         return brt, brt_csum, iap_wait, delay
-        
+
     def initialize_options(self, status_packet):
         """Initialize options"""
 
         # create option state
-        self.options = Stc12Option(status_packet[23:27])
+        self.options = Stc12Option(status_packet[23:26] + status_packet[27:28])
         self.options.print()
 
     def handshake(self):
@@ -1354,13 +894,10 @@ class Stc12Protocol(StcBaseProtocol):
             packet += struct.pack(">H", self.PROGRAM_BLOCKSIZE)
             packet += data[i:i+self.PROGRAM_BLOCKSIZE]
             while len(packet) < self.PROGRAM_BLOCKSIZE + 7: packet += b"\x00"
-            csum = sum(packet[7:]) & 0xff
             self.write_packet(packet)
             response = self.read_packet()
             if response[0] != 0x00:
                 raise StcProtocolException("incorrect magic in write packet")
-            elif response[1] != csum:
-                raise StcProtocolException("verification checksum mismatch")
             print(".", end="")
             sys.stdout.flush()
         print(" done")
@@ -1375,26 +912,19 @@ class Stc12Protocol(StcBaseProtocol):
             raise StcProtocolException("incorrect magic in finish packet")
         print("done")
 
-    def program_options(self):
-        print("Setting options: ", end="")
-        sys.stdout.flush()
-        msr = self.options.get_msr()
-        packet = bytes([0x8d, msr[0], msr[1], msr[2], msr[3],
-                        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                        0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
 
-        packet += struct.pack(">I", int(self.mcu_clock_hz))
-        self.write_packet(packet)
-        response = self.read_packet()
-        if response[0] != 0x50:
-            raise StcProtocolException("incorrect magic in option packet")
-        print("done")
+class Stc12Protocol(Stc12OptionsMixIn, Stc12BaseProtocol):
+    """STC 10/11/12 series protocol handler"""
 
-        # If UID wasn't sent with erase acknowledge, it should be in this packet
-        if not self.uid:
-            self.uid = response[18:25]
+    def __init__(self, port, handshake, baud):
+        Stc12BaseProtocol.__init__(self, port, handshake, baud)
 
-        print("Target UID: %s" % Utils.hexstr(self.uid))
+
+class Stc12BProtocol(Stc12AOptionsMixIn, Stc12BaseProtocol):
+    """STC 10/11/12 variant protocol handler"""
+
+    def __init__(self, port, handshake, baud):
+        Stc12BaseProtocol.__init__(self, port, handshake, baud)
 
 
 class Stc15AProtocol(Stc12Protocol):
@@ -1434,8 +964,6 @@ class Stc15AProtocol(Stc12Protocol):
     def initialize_status(self, packet):
         """Decode status packet and store basic MCU info"""
 
-        self.mcu_magic, = struct.unpack(">H", packet[20:22])
-
         freq_counter = 0
         for i in range(4):
             freq_counter += struct.unpack(">H", packet[1+2*i:3+2*i])[0]
@@ -1444,7 +972,7 @@ class Stc15AProtocol(Stc12Protocol):
 
         bl_version, bl_stepping = struct.unpack("BB", packet[17:19])
         self.mcu_bsl_version = "%d.%d%s" % (bl_version >> 4, bl_version & 0x0f,
-                                           chr(bl_stepping))
+                                            chr(bl_stepping))
 
         self.trim_data = packet[51:58]
         self.freq_counter = freq_counter
@@ -1498,7 +1026,8 @@ class Stc15AProtocol(Stc12Protocol):
         """
 
         user_speed = self.trim_frequency
-        if user_speed <= 0: user_speed = self.mcu_clock_hz
+        if user_speed <= 0:
+            user_speed = self.mcu_clock_hz
         program_speed = 22118400
 
         user_count = int(self.freq_counter * (user_speed / self.mcu_clock_hz))
@@ -1524,7 +1053,7 @@ class Stc15AProtocol(Stc12Protocol):
         packet += bytes([0x98, 0x00, 0x02, 0x00])
         packet += bytes([0x98, 0x80, 0x02, 0x00])
         self.write_packet(packet)
-        self.pulse()
+        self.pulse(timeout=1.0)
         response = self.read_packet()
         if response[0] != 0x65:
             raise StcProtocolException("incorrect magic in handshake packet")
@@ -1566,7 +1095,7 @@ class Stc15AProtocol(Stc12Protocol):
             packet += struct.pack(">H", target_trim_start + i)
             packet += bytes([0x02, 0x00])
         self.write_packet(packet)
-        self.pulse()
+        self.pulse(timeout=1.0)
         response = self.read_packet()
         if response[0] != 0x65:
             raise StcProtocolException("incorrect magic in handshake packet")
@@ -1615,6 +1144,7 @@ class Stc15AProtocol(Stc12Protocol):
 
         print("Target UID: %s" % Utils.hexstr(self.uid))
 
+
 class Stc15Protocol(Stc15AProtocol):
     """Protocol handler for later STC 15 series"""
 
@@ -1627,13 +1157,11 @@ class Stc15Protocol(Stc15AProtocol):
         """Initialize options"""
 
         # create option state
-        self.options = Stc15Option(status_packet[5:8] + status_packet[12:13])
+        self.options = Stc15Option(status_packet[5:8] + status_packet[12:13] + status_packet[37:38])
         self.options.print()
 
     def initialize_status(self, packet):
         """Decode status packet and store basic MCU info"""
-
-        self.mcu_magic, = struct.unpack(">H", packet[20:22])
 
         # check bit that control internal vs. external clock source
         # get frequency either stored from calibration or from
@@ -1657,8 +1185,7 @@ class Stc15Protocol(Stc15AProtocol):
         bl_version, bl_stepping = struct.unpack("BB", packet[17:19])
         bl_minor = packet[22] & 0x0f
         self.mcu_bsl_version = "%d.%d.%d%s" % (bl_version >> 4, bl_version & 0x0f,
-                                           bl_minor,
-                                           chr(bl_stepping))
+                                               bl_minor, chr(bl_stepping))
         self.bsl_version = bl_version
 
     def print_mcu_info(self):
@@ -1731,8 +1258,7 @@ class Stc15Protocol(Stc15AProtocol):
         packet += bytes([0x00, 0x40, 0x80, 0x40, 0xff, 0x40])
         packet += bytes([0x00, 0x00, 0x80, 0x00, 0xc0, 0x00])
         self.write_packet(packet)
-        self.ser.write(bytes([0x92, 0x92, 0x92, 0x92]))
-        self.ser.flush()
+        self.pulse(b"\xfe", timeout=1.0)
         response = self.read_packet()
         if response[0] != 0x00:
             raise StcProtocolException("incorrect magic in handshake packet")
@@ -1751,8 +1277,7 @@ class Stc15Protocol(Stc15AProtocol):
         for i in range(prog_trim[0] - 3, prog_trim[0] + 3):
             packet += bytes([i & 0xff, prog_trim[1]])
         self.write_packet(packet)
-        self.ser.write(bytes([0x92, 0x92, 0x92, 0x92]))
-        self.ser.flush()
+        self.pulse(b"\xfe", timeout=1.0)
         response = self.read_packet()
         if response[0] != 0x00:
             raise StcProtocolException("incorrect magic in handshake packet")
@@ -1775,7 +1300,7 @@ class Stc15Protocol(Stc15AProtocol):
         # This is a bit of a hack, but it works.
         bauds = self.baud_transfer if (self.mcu_magic >> 8) == 0xf2 else self.baud_transfer * 4
         packet += struct.pack(">H", int(65535 - program_speed / bauds))
-        packet += struct.pack(">H", int(65535 - (program_speed / bauds) * 1.5))
+        packet += bytes(user_trim)
         iap_wait = self.get_iap_delay(program_speed)
         packet += bytes([iap_wait])
         self.write_packet(packet)
@@ -1823,6 +1348,8 @@ class Stc15Protocol(Stc15AProtocol):
             packet += bytes([0x00, 0x00, 0x5a, 0xa5])
         self.write_packet(packet)
         response = self.read_packet()
+        if response[0] == 0x0f:
+            raise StcProtocolException("MCU is locked")
         if response[0] != 0x05:
             raise StcProtocolException("incorrect magic in handshake packet")
 
@@ -1880,17 +1407,14 @@ class Stc15Protocol(Stc15AProtocol):
             response = self.read_packet()
             if response[0] != 0x07 or response[1] != 0x54:
                 raise StcProtocolException("incorrect magic in finish packet")
-            print(" done")
+            print("done")
 
-    def program_options(self):
-        print("Setting options: ", end="")
-        sys.stdout.flush()
+    def build_options(self):
+        """Build a 64 byte packet of option data from the current
+        configuration."""
+
         msr = self.options.get_msr()
-
-        packet = bytes([0x04, 0x00, 0x00])
-        if self.bsl_version >= 0x72:
-            packet += bytes([0x5a, 0xa5])
-        packet += bytes([0xff] * 23)
+        packet = bytes([0xff] * 23)
         packet += bytes([(self.trim_frequency >> 24) & 0xff,
                          0xff,
                          (self.trim_frequency >> 16) & 0xff,
@@ -1900,9 +1424,24 @@ class Stc15Protocol(Stc15AProtocol):
                          (self.trim_frequency >> 0) & 0xff,
                          0xff])
         packet += bytes([msr[3]])
-        packet += bytes([0xff] * 27)
+        packet += bytes([0xff] * 23)
+        if len(msr) > 4:
+            packet += bytes([msr[4]])
+        else:
+            packet += bytes([0xff])
+        packet += bytes([0xff] * 3)
         packet += bytes([self.trim_value[0], self.trim_value[1] + 0x3f])
         packet += msr[0:3]
+        return packet
+
+    def program_options(self):
+        print("Setting options: ", end="")
+        sys.stdout.flush()
+
+        packet = bytes([0x04, 0x00, 0x00])
+        if self.bsl_version >= 0x72:
+            packet += bytes([0x5a, 0xa5])
+        packet += self.build_options()
         self.write_packet(packet)
         response = self.read_packet()
         if response[0] != 0x04 or response[1] != 0x54:
@@ -1912,3 +1451,169 @@ class Stc15Protocol(Stc15AProtocol):
         print("Target UID: %s" % Utils.hexstr(self.uid))
 
 
+class StcUsb15Protocol(Stc15Protocol):
+    """USB should use large blocks"""
+    PROGRAM_BLOCKSIZE = 128
+
+    """VID of STC devices"""
+    USB_VID = 0x5354
+
+    """PID of STC devices"""
+    USB_PID = 0x4312
+
+    def __init__(self):
+        # XXX: this is really ugly!
+        Stc15Protocol.__init__(self, "", 0, 0, 0)
+        self.dev = None
+
+    def dump_packet(self, data, request=0, value=0, index=0, receive=True):
+        if self.debug:
+            print("%s bRequest=%02X wValue=%04X wIndex=%04X data: %s" %
+                  (("<-" if receive else "->"), request, value, index,
+                   Utils.hexstr(data, " ")), file=sys.stderr)
+
+    def read_packet(self):
+        """Read a packet from the MCU"""
+
+        dev2host = usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE | usb.util.CTRL_IN
+        packet = self.dev.ctrl_transfer(dev2host, 0, 0, 0, 132).tobytes()
+        if len(packet) < 5 or packet[0] != 0x46 or packet[1] != 0xb9:
+            self.dump_packet(packet)
+            raise StcFramingException("incorrect frame start")
+
+        data_len = packet[2]
+        if (data_len) > len(packet) + 3:
+            self.dump_packet(packet)
+            raise StcFramingException("frame length mismatch")
+
+        data = packet[2:-1]
+        csum = functools.reduce(lambda x, y: x - y, data, 0) & 0xff
+        if csum != packet[-1]:
+            self.dump_packet(packet)
+            raise StcFramingException("frame checksum mismatch")
+
+        self.dump_packet(packet, receive=True)
+        return packet[3:3+data_len]
+
+    def write_packet(self, request, value=0, index=0, data=bytes([0])):
+        """Write USB control packet"""
+
+        # Control transfers are maximum of 8 bytes each, and every
+        # invidual partial transfer is checksummed individually.
+        i = 0
+        chunks = bytes()
+        while i < len(data):
+            c = data[i:i+7]
+            csum = functools.reduce(lambda x, y: x - y, c, 0) & 0xff
+            chunks += c + bytes([csum])
+            i += 7
+
+        self.dump_packet(chunks, request, value, index, receive=False)
+        host2dev = usb.util.CTRL_TYPE_VENDOR | usb.util.CTRL_RECIPIENT_DEVICE | usb.util.CTRL_OUT
+        self.dev.ctrl_transfer(host2dev, request, value, index, chunks)
+
+    def connect(self, autoreset=False, resetcmd=False):
+        """Connect to USB device and read info packet"""
+
+        # USB support is optional. Provide an error if pyusb is not available.
+        if not _usb_available:
+            raise StcProtocolException(
+                "USB support not available. " +
+                "pyusb is not installed or not working correctly.")
+
+        print("Waiting for MCU, please cycle power: ", end="")
+        sys.stdout.flush()
+
+        self.status_packet = None
+        while not self.status_packet:
+            try:
+                self.dev = usb.core.find(idVendor=self.USB_VID, idProduct=self.USB_PID)
+                if self.dev:
+                    self.dev.set_configuration()
+                    self.status_packet = self.read_packet()
+                    if len(self.status_packet) < 38:
+                        self.status_packet = None
+                        raise StcFramingException
+                else: raise StcFramingException
+            except StcFramingException:
+                time.sleep(0.5)
+            except usb.core.USBError as err:
+                if err.errno == errno.EACCES:
+                    raise IOError(err.strerror)
+
+        self.initialize_model()
+        print("done")
+
+    def handshake(self):
+        print("Initializing: ", end="")
+        sys.stdout.flush()
+
+        # handshake
+        self.write_packet(0x01, 0, 0, bytes([0x03]))
+        response = self.read_packet()
+        if response[0] != 0x01:
+            raise StcProtocolException("incorrect magic in handshake packet")
+
+        # enable/unlock MCU
+        self.write_packet(0x05, 0xa55a, 0)
+        response = self.read_packet()
+        if response[0] == 0x0f:
+            raise StcProtocolException("MCU is locked")
+        if response[0] != 0x05:
+            raise StcProtocolException("incorrect magic in handshake packet")
+
+        print("done")
+
+    def erase_flash(self, code, eeprom):
+        print("Erasing flash: ", end="")
+        sys.stdout.flush()
+        self.write_packet(0x03, 0xa55a, 0)
+        # XXX: better way to detect MCU has finished
+        time.sleep(2)
+        packet = self.read_packet()
+        if packet[0] != 0x03:
+            raise StcProtocolException("incorrect magic in erase packet")
+        self.uid = packet[1:8]
+        print("done")
+
+    def program_flash(self, data):
+        """Program the MCU's flash memory."""
+
+        print("Writing %d bytes: " % len(data), end="")
+        sys.stdout.flush()
+        for i in range(0, len(data), self.PROGRAM_BLOCKSIZE):
+            packet = data[i:i+self.PROGRAM_BLOCKSIZE]
+            while len(packet) < self.PROGRAM_BLOCKSIZE: packet += b"\x00"
+            self.write_packet(0x22 if i == 0 else 0x02, 0xa55a, i, packet)
+            # XXX: better way to detect MCU has finished
+            time.sleep(0.1)
+            response = self.read_packet()
+            if response[0] != 0x02 or response[1] != 0x54:
+                raise StcProtocolException("incorrect magic in write packet")
+            print(".", end="")
+            sys.stdout.flush()
+        print(" done")
+
+    def program_options(self):
+        print("Setting options: ", end="")
+        sys.stdout.flush()
+
+        # always use 24 MHz pre-tuned value for now
+        self.trim_value = (self.freq_count_24, 0x40)
+        self.trim_frequency = int(24E6)
+
+        packet = self.build_options()
+        self.write_packet(0x04, 0xa55a, 0, packet)
+        # XXX: better way to detect MCU has finished
+        time.sleep(0.5)
+        response = self.read_packet()
+        if response[0] != 0x04 or response[1] != 0x54:
+            raise StcProtocolException("incorrect magic in option packet")
+        print("done")
+
+        print("Target UID: %s" % Utils.hexstr(self.uid))
+
+    def disconnect(self):
+        if self.dev:
+            self.write_packet(0xff)
+            print("Disconnected!")
